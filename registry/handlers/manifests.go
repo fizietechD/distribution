@@ -6,26 +6,27 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/distribution/distribution/v3"
-	dcontext "github.com/distribution/distribution/v3/context"
+	"github.com/distribution/distribution/v3/internal/dcontext"
 	"github.com/distribution/distribution/v3/manifest/manifestlist"
 	"github.com/distribution/distribution/v3/manifest/ocischema"
 	"github.com/distribution/distribution/v3/manifest/schema2"
-	"github.com/distribution/distribution/v3/reference"
 	"github.com/distribution/distribution/v3/registry/api/errcode"
-	v2 "github.com/distribution/distribution/v3/registry/api/v2"
-	"github.com/distribution/distribution/v3/registry/auth"
+	"github.com/distribution/distribution/v3/registry/storage"
 	"github.com/distribution/distribution/v3/registry/storage/driver"
+	"github.com/distribution/reference"
 	"github.com/gorilla/handlers"
 	"github.com/opencontainers/go-digest"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
 	defaultArch         = "amd64"
 	defaultOS           = "linux"
-	maxManifestBodySize = 4 << 20
+	maxManifestBodySize = 4 * 1024 * 1024
 	imageClass          = "image"
 )
 
@@ -119,7 +120,7 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 		desc, err := tags.Get(imh, imh.Tag)
 		if err != nil {
 			if _, ok := err.(distribution.ErrTagUnknown); ok {
-				imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithDetail(err))
+				imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithDetail(err))
 			} else {
 				imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 			}
@@ -140,7 +141,7 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 	manifest, err := manifests.Get(imh, imh.Digest, options...)
 	if err != nil {
 		if _, ok := err.(distribution.ErrManifestUnknownRevision); ok {
-			imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithDetail(err))
+			imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithDetail(err))
 		} else {
 			imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 		}
@@ -160,11 +161,11 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if manifestType == ociSchema && !supports[ociSchema] {
-		imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithMessage("OCI manifest found, but accept header does not support OCI manifests"))
+		imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithMessage("OCI manifest found, but accept header does not support OCI manifests"))
 		return
 	}
 	if manifestType == ociImageIndexSchema && !supports[ociImageIndexSchema] {
-		imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithMessage("OCI index found, but accept header does not support OCI indexes"))
+		imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithMessage("OCI index found, but accept header does not support OCI indexes"))
 		return
 	}
 
@@ -183,14 +184,14 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 		}
 
 		if manifestDigest == "" {
-			imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown)
+			imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown)
 			return
 		}
 
 		manifest, err = manifests.Get(imh, manifestDigest)
 		if err != nil {
 			if _, ok := err.(distribution.ErrManifestUnknownRevision); ok {
-				imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithDetail(err))
+				imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithDetail(err))
 			} else {
 				imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 			}
@@ -198,7 +199,7 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 		}
 
 		if _, isSchema2 := manifest.(*schema2.DeserializedManifest); isSchema2 && !supports[manifestSchema2] {
-			imh.Errors = append(imh.Errors, v2.ErrorCodeManifestInvalid.WithMessage("Schema 2 manifest not supported by client"))
+			imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestInvalid.WithMessage("Schema 2 manifest not supported by client"))
 			return
 		} else {
 			imh.Digest = manifestDigest
@@ -214,7 +215,14 @@ func (imh *manifestHandler) GetManifest(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Length", fmt.Sprint(len(p)))
 	w.Header().Set("Docker-Content-Digest", imh.Digest.String())
 	w.Header().Set("Etag", fmt.Sprintf(`"%s"`, imh.Digest))
-	w.Write(p)
+
+	if r.Method == http.MethodHead {
+		return
+	}
+
+	if _, err := w.Write(p); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
 }
 
 func etagMatch(r *http.Request, etag string) bool {
@@ -238,27 +246,27 @@ func (imh *manifestHandler) PutManifest(w http.ResponseWriter, r *http.Request) 
 	var jsonBuf bytes.Buffer
 	if err := copyFullPayload(imh, w, r, &jsonBuf, maxManifestBodySize, "image manifest PUT"); err != nil {
 		// copyFullPayload reports the error if necessary
-		imh.Errors = append(imh.Errors, v2.ErrorCodeManifestInvalid.WithDetail(err.Error()))
+		imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestInvalid.WithDetail(err.Error()))
 		return
 	}
 
 	mediaType := r.Header.Get("Content-Type")
 	manifest, desc, err := distribution.UnmarshalManifest(mediaType, jsonBuf.Bytes())
 	if err != nil {
-		imh.Errors = append(imh.Errors, v2.ErrorCodeManifestInvalid.WithDetail(err))
+		imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestInvalid.WithDetail(err))
 		return
 	}
 
 	if imh.Digest != "" {
 		if desc.Digest != imh.Digest {
 			dcontext.GetLogger(imh).Errorf("payload digest does not match: %q != %q", desc.Digest, imh.Digest)
-			imh.Errors = append(imh.Errors, v2.ErrorCodeDigestInvalid)
+			imh.Errors = append(imh.Errors, errcode.ErrorCodeDigestInvalid)
 			return
 		}
 	} else if imh.Tag != "" {
 		imh.Digest = desc.Digest
 	} else {
-		imh.Errors = append(imh.Errors, v2.ErrorCodeTagInvalid.WithDetail("no tag or digest specified"))
+		imh.Errors = append(imh.Errors, errcode.ErrorCodeTagInvalid.WithDetail("no tag or digest specified"))
 		return
 	}
 
@@ -297,14 +305,14 @@ func (imh *manifestHandler) PutManifest(w http.ResponseWriter, r *http.Request) 
 			for _, verificationError := range err {
 				switch verificationError := verificationError.(type) {
 				case distribution.ErrManifestBlobUnknown:
-					imh.Errors = append(imh.Errors, v2.ErrorCodeManifestBlobUnknown.WithDetail(verificationError.Digest))
+					imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestBlobUnknown.WithDetail(verificationError.Digest))
 				case distribution.ErrManifestNameInvalid:
-					imh.Errors = append(imh.Errors, v2.ErrorCodeNameInvalid.WithDetail(err))
+					imh.Errors = append(imh.Errors, errcode.ErrorCodeNameInvalid.WithDetail(err))
 				case distribution.ErrManifestUnverified:
-					imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnverified)
+					imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnverified)
 				default:
 					if verificationError == digest.ErrDigestInvalidFormat {
-						imh.Errors = append(imh.Errors, v2.ErrorCodeDigestInvalid)
+						imh.Errors = append(imh.Errors, errcode.ErrorCodeDigestInvalid)
 					} else {
 						imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown, verificationError)
 					}
@@ -395,7 +403,7 @@ func (imh *manifestHandler) applyResourcePolicy(manifest distribution.Manifest) 
 		return errcode.ErrorCodeDenied.WithMessage(fmt.Sprintf("registry does not allow %s manifest", class))
 	}
 
-	resources := auth.AuthorizedResources(imh)
+	resources := authorizedResources(imh)
 	n := imh.Repository.Named().Name()
 
 	var foundResource bool
@@ -434,7 +442,7 @@ func (imh *manifestHandler) DeleteManifest(w http.ResponseWriter, r *http.Reques
 		if err := tagService.Untag(imh.Context, imh.Tag); err != nil {
 			switch err.(type) {
 			case distribution.ErrTagUnknown, driver.PathNotFoundError:
-				imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown.WithDetail(err))
+				imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown.WithDetail(err))
 			default:
 				imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
 			}
@@ -455,10 +463,10 @@ func (imh *manifestHandler) DeleteManifest(w http.ResponseWriter, r *http.Reques
 		switch err {
 		case digest.ErrDigestUnsupported:
 		case digest.ErrDigestInvalidFormat:
-			imh.Errors = append(imh.Errors, v2.ErrorCodeDigestInvalid)
+			imh.Errors = append(imh.Errors, errcode.ErrorCodeDigestInvalid)
 			return
 		case distribution.ErrBlobUnknown:
-			imh.Errors = append(imh.Errors, v2.ErrorCodeManifestUnknown)
+			imh.Errors = append(imh.Errors, errcode.ErrorCodeManifestUnknown)
 			return
 		case distribution.ErrUnsupported:
 			imh.Errors = append(imh.Errors, errcode.ErrorCodeUnsupported)
@@ -470,18 +478,32 @@ func (imh *manifestHandler) DeleteManifest(w http.ResponseWriter, r *http.Reques
 	}
 
 	tagService := imh.Repository.Tags(imh)
-	referencedTags, err := tagService.Lookup(imh, distribution.Descriptor{Digest: imh.Digest})
+	referencedTags, err := tagService.Lookup(imh, v1.Descriptor{Digest: imh.Digest})
 	if err != nil {
 		imh.Errors = append(imh.Errors, err)
 		return
 	}
 
+	var (
+		errs []error
+		mu   sync.Mutex
+	)
+	g := errgroup.Group{}
+	g.SetLimit(storage.DefaultConcurrencyLimit)
 	for _, tag := range referencedTags {
-		if err := tagService.Untag(imh, tag); err != nil {
-			imh.Errors = append(imh.Errors, err)
-			return
-		}
+		tag := tag
+
+		g.Go(func() error {
+			if err := tagService.Untag(imh, tag); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+			}
+			return nil
+		})
 	}
+	_ = g.Wait() // imh will record all errors, so ignore the error of Wait()
+	imh.Errors = errs
 
 	w.WriteHeader(http.StatusAccepted)
 }
